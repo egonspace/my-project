@@ -1,0 +1,143 @@
+package listener
+
+import (
+	"context"
+	"fmt"
+	"gateway/blockchain"
+	"gateway/db"
+	"gateway/firmbanking"
+	"gateway/model"
+	"log"
+	"time"
+)
+
+type ChainListener struct {
+	stateDB     *db.StateDB
+	blockchain  blockchain.Client
+	firmBanking firmbanking.Client
+}
+
+func NewChainListener(stateDB *db.StateDB, bc blockchain.Client, fb firmbanking.Client) *ChainListener {
+	return &ChainListener{
+		stateDB:     stateDB,
+		blockchain:  bc,
+		firmBanking: fb,
+	}
+}
+
+func (l *ChainListener) Start(ctx context.Context) error {
+	mintCh := make(chan blockchain.MintEvent, 100)
+	burnCh := make(chan blockchain.BurnEvent, 100)
+
+	if err := l.blockchain.SubscribeMintEvents(ctx, mintCh); err != nil {
+		return fmt.Errorf("SubscribeMintEvents failed: %w", err)
+	}
+	if err := l.blockchain.SubscribeBurnEvents(ctx, burnCh); err != nil {
+		return fmt.Errorf("SubscribeBurnEvents failed: %w", err)
+	}
+
+	log.Println("[ChainListener] started")
+
+	go l.listenMintEvents(ctx, mintCh)
+	go l.listenBurnEvents(ctx, burnCh)
+
+	return nil
+}
+
+func (l *ChainListener) listenMintEvents(ctx context.Context, ch <-chan blockchain.MintEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[ChainListener] listenMintEvents stopped")
+			return
+		case event, ok := <-ch:
+			if !ok {
+				log.Println("[ChainListener] mintCh closed")
+				return
+			}
+			l.handleMintEvent(event)
+		}
+	}
+}
+
+func (l *ChainListener) listenBurnEvents(ctx context.Context, ch <-chan blockchain.BurnEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[ChainListener] listenBurnEvents stopped")
+			return
+		case event, ok := <-ch:
+			if !ok {
+				log.Println("[ChainListener] burnCh closed")
+				return
+			}
+			l.handleBurnEvent(event)
+		}
+	}
+}
+
+func (l *ChainListener) handleMintEvent(event blockchain.MintEvent) {
+	log.Printf("[ChainListener] MintEvent received txHash=%s amount=%d", event.TxHash, event.Amount)
+
+	record, err := l.stateDB.GetRequestByTxHash(event.TxHash)
+	if err != nil {
+		log.Printf("[ChainListener] handleMintEvent GetRequestByTxHash error: %v", err)
+		return
+	}
+	if record == nil {
+		log.Printf("[ChainListener] handleMintEvent no request found for txHash=%s", event.TxHash)
+		return
+	}
+	if record.Status == model.StatusSuccess {
+		log.Printf("[ChainListener] handleMintEvent already succeeded id=%d", record.ID)
+		return
+	}
+
+	record.Status = model.StatusSuccess
+	if err := l.stateDB.UpdateRequest(record); err != nil {
+		log.Printf("[ChainListener] handleMintEvent UpdateRequest error: %v", err)
+		return
+	}
+	log.Printf("[ChainListener] MintEvent confirmed id=%d txHash=%s status=SUCCESS", record.ID, event.TxHash)
+}
+
+func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
+	log.Printf("[ChainListener] BurnEvent received txHash=%s burner=%s amount=%d",
+		event.TxHash, event.Burner, event.Amount)
+
+	record := &model.Request{
+		Type:        model.TypeBurn,
+		Status:      model.StatusRequested,
+		RequesterID: event.Burner,
+		TxHash:      event.TxHash,
+		Amount:      event.Amount,
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	id, err := l.stateDB.InsertRequest(record)
+	if err != nil {
+		log.Printf("[ChainListener] handleBurnEvent InsertRequest error: %v", err)
+		return
+	}
+	record.ID = id
+	log.Printf("[ChainListener] BurnEvent inserted request id=%d status=REQUESTED", id)
+
+	transferReq := &firmbanking.TransferRequest{
+		ToAccountNo: event.Burner,
+		Amount:      event.Amount,
+		RefID:       event.TxHash,
+	}
+	if err := l.firmBanking.Transfer(transferReq); err != nil {
+		log.Printf("[ChainListener] handleBurnEvent Transfer error: %v", err)
+		record.Status = model.StatusFailure
+		record.ErrorCode = model.ErrorCodeBankingFailed
+		_ = l.stateDB.UpdateRequest(record)
+		return
+	}
+
+	record.Status = model.StatusSuccess
+	if err := l.stateDB.UpdateRequest(record); err != nil {
+		log.Printf("[ChainListener] handleBurnEvent UpdateRequest error: %v", err)
+		return
+	}
+	log.Printf("[ChainListener] BurnEvent completed id=%d status=SUCCESS", id)
+}
