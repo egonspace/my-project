@@ -31,7 +31,7 @@ const fiatManagerABIJSON = `[
       {"name": "_to",         "type": "address"},
       {"name": "_amount",     "type": "uint256"},
       {"name": "_expiration", "type": "uint256"},
-      {"name": "_txId",       "type": "uint256"}
+      {"name": "_txId",       "type": "bytes"}
     ],
     "outputs": []
   },
@@ -40,8 +40,8 @@ const fiatManagerABIJSON = `[
     "type": "event",
     "anonymous": false,
     "inputs": [
-      {"name": "_txId",   "type": "uint256", "indexed": true},
       {"name": "_minter", "type": "address", "indexed": true},
+      {"name": "_txId",   "type": "bytes",   "indexed": false},
       {"name": "_amount", "type": "uint256", "indexed": false}
     ]
   },
@@ -50,7 +50,6 @@ const fiatManagerABIJSON = `[
     "type": "event",
     "anonymous": false,
     "inputs": [
-      {"name": "_txId",   "type": "uint256", "indexed": true},
       {"name": "_minter", "type": "address", "indexed": true},
       {"name": "_amount", "type": "uint256", "indexed": false}
     ]
@@ -77,7 +76,6 @@ type MintEvent struct {
 
 type BurnEvent struct {
 	TxHash      string
-	OnChainTxID string // 컨트랙트의 _txId
 	Burner      string
 	Amount      int64 // 원(KRW) 단위 — decimal 역변환 완료
 	BlockNumber uint64
@@ -85,8 +83,9 @@ type BurnEvent struct {
 
 type Client interface {
 	SendMintTx(ctx context.Context, requesterID string, toAddress string, bankTx string, amount int64, expiration int64) (string, error)
-	SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent) error
-	SubscribeBurnEvents(ctx context.Context, ch chan<- BurnEvent) error
+	// fromBlock: 0이면 현재 시점부터 구독, >0이면 해당 블록부터 히스토리 스캔 후 구독
+	SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent, fromBlock uint64) error
+	SubscribeBurnEvents(ctx context.Context, ch chan<- BurnEvent, fromBlock uint64) error
 }
 
 type EthClient struct {
@@ -148,7 +147,7 @@ func NewEthClient(rpcURL, wsURL, fiatManagerAddr, fiatTokenAddr, privateKeyHex s
 	}, nil
 }
 
-// fetchDecimalMultiplier는 토큰 컨트랙트의 decimals()를 호출해 10^decimal 을 반환합니다.
+// fetchDecimalMultiplier는 토큰 컨트랙트의 decimals()를 호출해 10^decimal 을 반환
 func fetchDecimalMultiplier(ctx context.Context, client *ethclient.Client, tokenAddr common.Address, tokenABI abi.ABI) (*big.Int, error) {
 	callData, err := tokenABI.Pack("decimals")
 	if err != nil {
@@ -180,20 +179,13 @@ func fetchDecimalMultiplier(ctx context.Context, client *ethclient.Client, token
 	return multiplier, nil
 }
 
-// bankTxToTxID는 string 타입의 bankTx를 컨트랙트의 uint256 _txId로 변환합니다.
-// keccak256 해시를 사용하여 결정론적이고 충돌 저항성이 있는 uint256을 생성합니다.
-func bankTxToTxID(bankTx string) *big.Int {
-	hash := crypto.Keccak256([]byte(bankTx))
-	return new(big.Int).SetBytes(hash)
-}
-
-// toContractAmount는 원(KRW) 단위 금액을 컨트랙트 토큰 단위로 변환합니다.
+// toContractAmount는 원(KRW) 단위 금액을 컨트랙트 토큰 단위로 변환
 // contractAmount = bankAmount × 10^decimal
 func (c *EthClient) toContractAmount(bankAmount int64) *big.Int {
 	return new(big.Int).Mul(big.NewInt(bankAmount), c.decimalMultiplier)
 }
 
-// toBankAmount는 컨트랙트 토큰 단위 금액을 원(KRW) 단위로 역변환합니다.
+// toBankAmount는 컨트랙트 토큰 단위 금액을 원(KRW) 단위로 역변환
 // bankAmount = contractAmount / 10^decimal
 func (c *EthClient) toBankAmount(contractAmount *big.Int) int64 {
 	return new(big.Int).Div(contractAmount, c.decimalMultiplier).Int64()
@@ -208,10 +200,9 @@ func (c *EthClient) SendMintTx(ctx context.Context, _ string, toAddress string, 
 
 	fromAddr := crypto.PubkeyToAddress(c.privateKey.PublicKey)
 	toAddr := common.HexToAddress(toAddress)
-	txID := bankTxToTxID(bankTx)
 	contractAmount := c.toContractAmount(amount) // 원 → 토큰 단위
 
-	data, err := c.fiatManagerABI.Pack("mintFromFiat", toAddr, contractAmount, big.NewInt(expiration), txID)
+	data, err := c.fiatManagerABI.Pack("mintFromFiat", toAddr, contractAmount, big.NewInt(expiration), []byte(bankTx))
 	if err != nil {
 		return "", fmt.Errorf("abi pack failed: %w", err)
 	}
@@ -296,13 +287,13 @@ func (c *EthClient) buildAndSignTx(ctx context.Context, client *ethclient.Client
 	return signedTx, nil
 }
 
-func (c *EthClient) SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent) error {
+func (c *EthClient) SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent, fromBlock uint64) error {
 	topic := c.fiatManagerABI.Events["FiatTokenMinted"].ID
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{c.fiatManagerAddr},
 		Topics:    [][]common.Hash{{topic}},
 	}
-	go c.subscribeWithRetry(ctx, query, func(l types.Log) {
+	go c.subscribeWithRetry(ctx, query, fromBlock, func(l types.Log) {
 		event, err := c.parseMintLog(l)
 		if err != nil {
 			log.Printf("[Blockchain] parseMintLog error: %v", err)
@@ -313,13 +304,13 @@ func (c *EthClient) SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent
 	return nil
 }
 
-func (c *EthClient) SubscribeBurnEvents(ctx context.Context, ch chan<- BurnEvent) error {
+func (c *EthClient) SubscribeBurnEvents(ctx context.Context, ch chan<- BurnEvent, fromBlock uint64) error {
 	topic := c.fiatManagerABI.Events["FiatTokenBurnt"].ID
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{c.fiatManagerAddr},
 		Topics:    [][]common.Hash{{topic}},
 	}
-	go c.subscribeWithRetry(ctx, query, func(l types.Log) {
+	go c.subscribeWithRetry(ctx, query, fromBlock, func(l types.Log) {
 		event, err := c.parseBurnLog(l)
 		if err != nil {
 			log.Printf("[Blockchain] parseBurnLog error: %v", err)
@@ -330,13 +321,25 @@ func (c *EthClient) SubscribeBurnEvents(ctx context.Context, ch chan<- BurnEvent
 	return nil
 }
 
-func (c *EthClient) subscribeWithRetry(ctx context.Context, query ethereum.FilterQuery, handler func(types.Log)) {
+func (c *EthClient) subscribeWithRetry(ctx context.Context, query ethereum.FilterQuery, fromBlock uint64, handler func(types.Log)) {
 	const retryDelay = 5 * time.Second
+
+	// currentFromBlock은 고루틴 내에서만 접근하므로 별도 동기화 불필요
+	currentFromBlock := fromBlock
+
+	// 로그 처리 후 다음 재연결 시 재개 지점을 갱신하는 래퍼
+	tracked := func(l types.Log) {
+		handler(l)
+		if next := l.BlockNumber + 1; next > currentFromBlock {
+			currentFromBlock = next
+		}
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := c.doSubscribe(ctx, query, handler); err != nil {
+		if err := c.doSubscribe(ctx, query, currentFromBlock, tracked); err != nil {
 			log.Printf("[Blockchain] subscription error: %v, retrying in %v", err, retryDelay)
 		}
 		select {
@@ -347,27 +350,61 @@ func (c *EthClient) subscribeWithRetry(ctx context.Context, query ethereum.Filte
 	}
 }
 
-func (c *EthClient) doSubscribe(ctx context.Context, query ethereum.FilterQuery, handler func(types.Log)) error {
+func (c *EthClient) doSubscribe(ctx context.Context, query ethereum.FilterQuery, fromBlock uint64, handler func(types.Log)) error {
 	wsClient, err := ethclient.DialContext(ctx, c.wsURL)
 	if err != nil {
 		return fmt.Errorf("ws dial failed: %w", err)
 	}
 	defer wsClient.Close()
 
-	logsCh := make(chan types.Log, 100)
-	sub, err := wsClient.SubscribeFilterLogs(ctx, query, logsCh)
+	// 라이브 구독을 먼저 시작해 히스토리 스캔과의 사이에서 이벤트가 누락되지 않도록 함
+	liveCh := make(chan types.Log, 100)
+	sub, err := wsClient.SubscribeFilterLogs(ctx, query, liveCh)
 	if err != nil {
 		return fmt.Errorf("SubscribeFilterLogs failed: %w", err)
 	}
 	defer sub.Unsubscribe()
 
-	log.Printf("[Blockchain] event subscription established for FiatManager=%s", c.fiatManagerAddr.Hex())
+	// fromBlock > 0 이면 마지막 처리 블록 이후부터 현재 블록까지 히스토리 스캔
+	if fromBlock > 0 {
+		header, err := wsClient.HeaderByNumber(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("get latest block failed: %w", err)
+		}
+		latestBlock := header.Number.Uint64()
+
+		if fromBlock <= latestBlock {
+			log.Printf("[Blockchain] scanning historical logs block %d → %d", fromBlock, latestBlock)
+			httpClient, err := ethclient.DialContext(ctx, c.rpcURL)
+			if err != nil {
+				return fmt.Errorf("http dial for history failed: %w", err)
+			}
+			histQuery := query
+			histQuery.FromBlock = new(big.Int).SetUint64(fromBlock)
+			histQuery.ToBlock = new(big.Int).SetUint64(latestBlock)
+			logs, err := httpClient.FilterLogs(ctx, histQuery)
+			httpClient.Close()
+			if err != nil {
+				// 히스토리 스캔 실패는 치명적이지 않음 — 경고 후 라이브 이벤트만 처리
+				log.Printf("[Blockchain] FilterLogs (historical) error: %v", err)
+			} else {
+				log.Printf("[Blockchain] replaying %d historical log(s)", len(logs))
+				for _, l := range logs {
+					if !l.Removed {
+						handler(l)
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("[Blockchain] live subscription active for FiatManager=%s (nextBlock=%d)", c.fiatManagerAddr.Hex(), fromBlock)
 
 	for {
 		select {
 		case err := <-sub.Err():
 			return fmt.Errorf("subscription dropped: %w", err)
-		case l := <-logsCh:
+		case l := <-liveCh:
 			if l.Removed {
 				continue
 			}
@@ -379,39 +416,43 @@ func (c *EthClient) doSubscribe(ctx context.Context, query ethereum.FilterQuery,
 }
 
 func (c *EthClient) parseMintLog(l types.Log) (*MintEvent, error) {
-	// Topics[0]=event sig, Topics[1]=_txId(uint256), Topics[2]=_minter(address)
-	if len(l.Topics) < 3 {
-		return nil, fmt.Errorf("FiatTokenMinted log: expected 3 topics, got %d", len(l.Topics))
+	// Topics[0]=event sig, Topics[1]=_minter(address, indexed)
+	// Data = ABI-encoded [_txId(bytes), _amount(uint256)]
+	if len(l.Topics) < 2 {
+		return nil, fmt.Errorf("FiatTokenMinted log: expected 2 topics, got %d", len(l.Topics))
 	}
-	var data struct{ Amount *big.Int }
-	if err := c.fiatManagerABI.UnpackIntoInterface(&data, "FiatTokenMinted", l.Data); err != nil {
+	var eventData struct {
+		TxId   []byte   `abi:"_txId"`
+		Amount *big.Int `abi:"_amount"`
+	}
+	if err := c.fiatManagerABI.UnpackIntoInterface(&eventData, "FiatTokenMinted", l.Data); err != nil {
 		return nil, fmt.Errorf("unpack FiatTokenMinted data: %w", err)
 	}
-	txID := new(big.Int).SetBytes(l.Topics[1].Bytes())
 	return &MintEvent{
 		TxHash:      l.TxHash.Hex(),
-		OnChainTxID: txID.String(),
-		To:          common.BytesToAddress(l.Topics[2].Bytes()).Hex(),
-		Amount:      c.toBankAmount(data.Amount), // 토큰 단위 → 원(KRW)
+		OnChainTxID: string(eventData.TxId), // bytes → 원본 bankTx 문자열
+		To:          common.BytesToAddress(l.Topics[1].Bytes()).Hex(),
+		Amount:      c.toBankAmount(eventData.Amount), // 토큰 단위 → 원(KRW)
 		BlockNumber: l.BlockNumber,
 	}, nil
 }
 
 func (c *EthClient) parseBurnLog(l types.Log) (*BurnEvent, error) {
-	// Topics[0]=event sig, Topics[1]=_txId(uint256), Topics[2]=_minter(address)
-	if len(l.Topics) < 3 {
-		return nil, fmt.Errorf("FiatTokenBurnt log: expected 3 topics, got %d", len(l.Topics))
+	// Topics[0]=event sig, Topics[1]=_minter(address, indexed)
+	// Data = ABI-encoded [_amount(uint256)]
+	if len(l.Topics) < 2 {
+		return nil, fmt.Errorf("FiatTokenBurnt log: expected 2 topics, got %d", len(l.Topics))
 	}
-	var data struct{ Amount *big.Int }
-	if err := c.fiatManagerABI.UnpackIntoInterface(&data, "FiatTokenBurnt", l.Data); err != nil {
+	var eventData struct {
+		Amount *big.Int `abi:"_amount"`
+	}
+	if err := c.fiatManagerABI.UnpackIntoInterface(&eventData, "FiatTokenBurnt", l.Data); err != nil {
 		return nil, fmt.Errorf("unpack FiatTokenBurnt data: %w", err)
 	}
-	txID := new(big.Int).SetBytes(l.Topics[1].Bytes())
 	return &BurnEvent{
 		TxHash:      l.TxHash.Hex(),
-		OnChainTxID: txID.String(),
-		Burner:      common.BytesToAddress(l.Topics[2].Bytes()).Hex(),
-		Amount:      c.toBankAmount(data.Amount), // 토큰 단위 → 원(KRW)
+		Burner:      common.BytesToAddress(l.Topics[1].Bytes()).Hex(),
+		Amount:      c.toBankAmount(eventData.Amount), // 토큰 단위 → 원(KRW)
 		BlockNumber: l.BlockNumber,
 	}, nil
 }

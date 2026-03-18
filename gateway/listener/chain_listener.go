@@ -2,6 +2,7 @@ package listener
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"gateway/blockchain"
 	"gateway/db"
@@ -10,6 +11,9 @@ import (
 	"log"
 	"time"
 )
+
+// listenerStateKey는 listener_state 테이블에서 FiatManager 리스너의 블록 진행 상황을 식별하는 키
+const listenerStateKey = "fiat_manager"
 
 type ChainListener struct {
 	stateDB     *db.StateDB
@@ -26,13 +30,22 @@ func NewChainListener(stateDB *db.StateDB, bc blockchain.Client, fb firmbanking.
 }
 
 func (l *ChainListener) Start(ctx context.Context) error {
+	// 재기동 시 마지막으로 처리 완료한 블록 이후부터 스캔
+	lastBlock, err := l.stateDB.GetLastBlock(listenerStateKey)
+	if err != nil {
+		return fmt.Errorf("GetLastBlock failed: %w", err)
+	}
+	if lastBlock > 0 {
+		log.Printf("[ChainListener] resuming from block %d", lastBlock)
+	}
+
 	mintCh := make(chan blockchain.MintEvent, 100)
 	burnCh := make(chan blockchain.BurnEvent, 100)
 
-	if err := l.blockchain.SubscribeMintEvents(ctx, mintCh); err != nil {
+	if err := l.blockchain.SubscribeMintEvents(ctx, mintCh, lastBlock); err != nil {
 		return fmt.Errorf("SubscribeMintEvents failed: %w", err)
 	}
-	if err := l.blockchain.SubscribeBurnEvents(ctx, burnCh); err != nil {
+	if err := l.blockchain.SubscribeBurnEvents(ctx, burnCh, lastBlock); err != nil {
 		return fmt.Errorf("SubscribeBurnEvents failed: %w", err)
 	}
 
@@ -87,10 +100,12 @@ func (l *ChainListener) handleMintEvent(event blockchain.MintEvent) {
 	}
 	if record == nil {
 		log.Printf("[ChainListener] handleMintEvent no request found for txHash=%s", event.TxHash)
+		l.saveLastBlock(event.BlockNumber)
 		return
 	}
 	if record.Status == model.StatusSuccess {
 		log.Printf("[ChainListener] handleMintEvent already succeeded id=%d", record.ID)
+		l.saveLastBlock(event.BlockNumber)
 		return
 	}
 
@@ -100,6 +115,7 @@ func (l *ChainListener) handleMintEvent(event blockchain.MintEvent) {
 		return
 	}
 	log.Printf("[ChainListener] MintEvent confirmed id=%d txHash=%s status=SUCCESS", record.ID, event.TxHash)
+	l.saveLastBlock(event.BlockNumber)
 }
 
 const retryPollInterval = 10 * time.Second
@@ -165,6 +181,11 @@ func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 	}
 	id, err := l.stateDB.InsertRequest(record)
 	if err != nil {
+		if errors.Is(err, db.ErrDuplicateTxHash) {
+			log.Printf("[ChainListener] handleBurnEvent duplicate txHash=%s, skipping", event.TxHash)
+			l.saveLastBlock(event.BlockNumber)
+			return
+		}
 		log.Printf("[ChainListener] handleBurnEvent InsertRequest error: %v", err)
 		return
 	}
@@ -176,6 +197,8 @@ func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 		Amount:      event.Amount,
 		RefID:       event.TxHash,
 	}
+	// firmBanking.Transfer는 동기방식으로 트랜잭셔널하게 처리된다고 가정
+	// 만약 비동기로 진행된다면 Status의 세분화 필요함 (예: PENDING -> SUCCESS/FAILURE)
 	if err := l.firmBanking.Transfer(transferReq); err != nil {
 		log.Printf("[ChainListener] handleBurnEvent Transfer error: %v", err)
 		record.Status = model.StatusFailure
@@ -190,4 +213,11 @@ func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 		return
 	}
 	log.Printf("[ChainListener] BurnEvent completed id=%d status=SUCCESS", id)
+	l.saveLastBlock(event.BlockNumber)
+}
+
+func (l *ChainListener) saveLastBlock(blockNumber uint64) {
+	if err := l.stateDB.UpsertLastBlock(listenerStateKey, blockNumber); err != nil {
+		log.Printf("[ChainListener] saveLastBlock error block=%d: %v", blockNumber, err)
+	}
 }

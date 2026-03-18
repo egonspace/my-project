@@ -10,7 +10,8 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
     address public admin;
     uint256 public totalAccumulatedMinted;
     uint256 public totalAccumulatedBurnt;
-    mapping(uint256 => bool) public usedTxId;
+    // bytes 타입의 txId는 mapping 키로 직접 사용 불가 → keccak256 해시를 키로 사용
+    mapping(bytes32 => bool) public usedTxId;
     mapping(address => bool) public authorized;
     mapping(address => uint256) public accumulatedMinted;
     mapping(address => uint256) public accumulatedBurnt;
@@ -20,9 +21,11 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
     event NewUserAuthorized(address _user);
     event UserDeauthorized(address _user);
 
-    modifier useTxId(uint256 _txId) {
-        require(!usedTxId[_txId], "FiatManager: txId was already used");
-        usedTxId[_txId] = true;
+    // _txId 원본(bytes)의 keccak256을 키로 중복 사용 여부를 검사
+    modifier useTxId(bytes memory _txId) {
+        bytes32 key = keccak256(_txId);
+        require(!usedTxId[key], "FiatManager: txId was already used");
+        usedTxId[key] = true;
         _;
     }
 
@@ -77,9 +80,11 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
         emit UserDeauthorized(_user);
     }
 
-    event FiatTokenMinted(uint256 indexed _txId, address indexed _minter, uint256 _amount);
-    event FiatTokenBurnt(uint256 indexed _txId, address indexed _minter, uint256 _amount);
-    event FiatTokenTransferred(uint256 indexed _txId, address indexed _minter, address _to, uint256 _amount);
+    // FiatTokenMinted: _txId는 은행 거래번호 원본(bytes). non-indexed로 선언하여 data payload에 원본 저장
+    // FiatTokenBurnt: Burn은 은행 거래번호가 없으므로 _txId 없음
+    event FiatTokenMinted(address indexed _minter, bytes _txId, uint256 _amount);
+    event FiatTokenBurnt(address indexed _minter, uint256 _amount);
+    event FiatTokenTransferred(address indexed _minter, address _to, bytes _txId, uint256 _amount);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -90,7 +95,7 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
         address _to,
         uint256 _amount,
         uint256 _expiration,
-        uint256 _txId) external onlyAdmin onlyAuthorized(_to) useTxId(_txId) {
+        bytes memory _txId) external onlyAdmin onlyAuthorized(_to) useTxId(_txId) {
 
         require(block.timestamp < _expiration, "FiatManager: mint request expired");
 
@@ -99,15 +104,14 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
         accumulatedMinted[_to] += _amount;
         totalAccumulatedMinted += _amount;
 
-        emit FiatTokenMinted(_txId, _to, _amount);
+        emit FiatTokenMinted(_to, _txId, _amount);
     }
 
     function burnForFiat(
         address _owner,
         uint256 _amount,
         uint256 _permitDeadline,
-        bytes memory _permitSignature,
-        uint256 _txId) external onlyAdmin onlyAuthorized(_owner) useTxId(_txId) {
+        bytes memory _permitSignature) external onlyAdmin onlyAuthorized(_owner) {
 
         require(_amount % (10**fiat.decimals()) == 0, "FiatGateway: only whole token amounts can be burned");
 
@@ -118,7 +122,7 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
         accumulatedBurnt[_owner] += _amount;
         totalAccumulatedBurnt += _amount;
 
-        emit FiatTokenBurnt(_txId, _owner, _amount);
+        emit FiatTokenBurnt(_owner, _amount);
     }
 
     function transferFrom(
@@ -129,10 +133,10 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
         uint256 _validBefore,
         bytes32 _nonce,
         bytes memory _signature,
-        uint256 _txId) external onlyAdmin useTxId(_txId) {
+        bytes memory _txId) external onlyAdmin useTxId(_txId) {
 
         fiat.transferWithAuthorization(_from, _to, _amount, _validAfter, _validBefore, _nonce, _signature);
 
-        emit FiatTokenTransferred(_txId, _from, _to, _amount);
+        emit FiatTokenTransferred(_from, _to, _txId, _amount);
     }
 }

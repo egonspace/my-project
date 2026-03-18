@@ -11,7 +11,10 @@ import (
 
 const pgUniqueViolation = "23505"
 
-var ErrDuplicateBankTx = errors.New("duplicate bank_tx")
+var (
+	ErrDuplicateBankTx = errors.New("duplicate bank_tx")
+	ErrDuplicateTxHash = errors.New("duplicate tx_hash")
+)
 
 const createUsersSQL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -37,10 +40,25 @@ CREATE TABLE IF NOT EXISTS requests (
 `
 
 // bank_tx가 NULL인 BURN 요청은 제외하고 MINT 요청에 대해서만 유일성 보장
-const createIndexSQL = `
+const createBankTxIndexSQL = `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_bank_tx
     ON requests (bank_tx)
     WHERE bank_tx IS NOT NULL;
+`
+
+// tx_hash가 빈 문자열인 REQUESTED 상태 행은 제외하고 체인 이벤트 중복 처리 방지
+const createTxHashIndexSQL = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_tx_hash
+    ON requests (tx_hash)
+    WHERE tx_hash != '';
+`
+
+// ChainListener가 마지막으로 처리한 블록 번호를 저장
+const createListenerStateSQL = `
+CREATE TABLE IF NOT EXISTS listener_state (
+    key        VARCHAR(255) PRIMARY KEY,
+    last_block BIGINT       NOT NULL DEFAULT 0
+);
 `
 
 type StateDB struct {
@@ -59,7 +77,14 @@ func NewStateDB(dsn string) (*StateDB, error) {
 }
 
 func (s *StateDB) CreateTable() error {
-	for _, stmt := range []string{createUsersSQL, createRequestsSQL, createIndexSQL} {
+	stmts := []string{
+		createUsersSQL,
+		createRequestsSQL,
+		createBankTxIndexSQL,
+		createTxHashIndexSQL,
+		createListenerStateSQL,
+	}
+	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
@@ -126,7 +151,12 @@ func (s *StateDB) InsertRequest(req *model.Request) (int64, error) {
 	).Scan(&id)
 	if err != nil {
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == pgUniqueViolation {
-			return 0, ErrDuplicateBankTx
+			switch pqErr.Constraint {
+			case "idx_requests_bank_tx":
+				return 0, ErrDuplicateBankTx
+			case "idx_requests_tx_hash":
+				return 0, ErrDuplicateTxHash
+			}
 		}
 		return 0, fmt.Errorf("InsertRequest failed: %w", err)
 	}
@@ -214,6 +244,33 @@ func (s *StateDB) GetRequestByTxHash(txHash string) (*model.Request, error) {
 		return nil, fmt.Errorf("GetRequestByTxHash failed: %w", err)
 	}
 	return req, nil
+}
+
+// GetLastBlock는 리스너가 마지막으로 처리 완료한 블록 번호를 반환합니다.
+// 기록이 없으면 0을 반환합니다.
+func (s *StateDB) GetLastBlock(key string) (uint64, error) {
+	var lastBlock uint64
+	err := s.db.QueryRow(`SELECT last_block FROM listener_state WHERE key = $1`, key).Scan(&lastBlock)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("GetLastBlock failed: %w", err)
+	}
+	return lastBlock, nil
+}
+
+// UpsertLastBlock는 리스너가 처리 완료한 블록 번호를 저장(없으면 insert, 있으면 update)합니다.
+func (s *StateDB) UpsertLastBlock(key string, block uint64) error {
+	query := `
+		INSERT INTO listener_state (key, last_block) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET last_block = EXCLUDED.last_block
+	`
+	_, err := s.db.Exec(query, key, block)
+	if err != nil {
+		return fmt.Errorf("UpsertLastBlock failed: %w", err)
+	}
+	return nil
 }
 
 // GetStaleMintRequests returns MINT requests that are still REQUESTED or PENDING
