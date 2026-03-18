@@ -40,6 +40,7 @@ func (l *ChainListener) Start(ctx context.Context) error {
 
 	go l.listenMintEvents(ctx, mintCh)
 	go l.listenBurnEvents(ctx, burnCh)
+	go l.runRetryPoller(ctx)
 
 	return nil
 }
@@ -101,17 +102,66 @@ func (l *ChainListener) handleMintEvent(event blockchain.MintEvent) {
 	log.Printf("[ChainListener] MintEvent confirmed id=%d txHash=%s status=SUCCESS", record.ID, event.TxHash)
 }
 
+const retryPollInterval = 10 * time.Second
+
+func (l *ChainListener) runRetryPoller(ctx context.Context) {
+	ticker := time.NewTicker(retryPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[ChainListener] retryPoller stopped")
+			return
+		case <-ticker.C:
+			l.timeoutStaleRequests()
+		}
+	}
+}
+
+func (l *ChainListener) timeoutStaleRequests() {
+	now := time.Now().Unix()
+	records, err := l.stateDB.GetStaleMintRequests(now)
+	if err != nil {
+		log.Printf("[ChainListener] GetStaleMintRequests error: %v", err)
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+	log.Printf("[ChainListener] retryPoller found %d timed-out mint request(s)", len(records))
+
+	for _, record := range records {
+		record.Status = model.StatusFailure
+		record.ErrorCode = model.ErrorCodeTxTimeout
+		if err := l.stateDB.UpdateRequest(record); err != nil {
+			log.Printf("[ChainListener] retryPoller UpdateRequest failed id=%d: %v", record.ID, err)
+			continue
+		}
+		log.Printf("[ChainListener] retryPoller timed out id=%d", record.ID)
+	}
+}
+
 func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 	log.Printf("[ChainListener] BurnEvent received txHash=%s burner=%s amount=%d",
 		event.TxHash, event.Burner, event.Amount)
 
+	user, err := l.stateDB.GetUserByAddress(event.Burner)
+	if err != nil {
+		log.Printf("[ChainListener] handleBurnEvent GetUserByAddress error: %v", err)
+		return
+	}
+	if user == nil {
+		log.Printf("[ChainListener] handleBurnEvent no user found for address=%s", event.Burner)
+		return
+	}
+
 	record := &model.Request{
-		Type:        model.TypeBurn,
-		Status:      model.StatusRequested,
-		RequesterID: event.Burner,
-		TxHash:      event.TxHash,
-		Amount:      event.Amount,
-		Timestamp:   time.Now().UnixMilli(),
+		Type:      model.TypeBurn,
+		Status:    model.StatusRequested,
+		UserID:    user.UserID,
+		TxHash:    event.TxHash,
+		Amount:    event.Amount,
+		Timestamp: time.Now().UnixMilli(),
 	}
 	id, err := l.stateDB.InsertRequest(record)
 	if err != nil {
@@ -119,10 +169,10 @@ func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 		return
 	}
 	record.ID = id
-	log.Printf("[ChainListener] BurnEvent inserted request id=%d status=REQUESTED", id)
+	log.Printf("[ChainListener] BurnEvent inserted request id=%d user_id=%s status=REQUESTED", id, user.UserID)
 
 	transferReq := &firmbanking.TransferRequest{
-		ToAccountNo: event.Burner,
+		ToAccountNo: user.AccountNo,
 		Amount:      event.Amount,
 		RefID:       event.TxHash,
 	}

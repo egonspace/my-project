@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"gateway/blockchain"
 	"gateway/db"
 	"gateway/model"
@@ -26,14 +27,9 @@ func NewHandler(stateDB *db.StateDB, bc blockchain.Client) *Handler {
 }
 
 type DepositRequest struct {
-	RequesterID string `json:"requester_id" binding:"required"`
-	ToAddress   string `json:"to_address"   binding:"required"`
-	BankTx      string `json:"bank_tx"      binding:"required"`
-	Amount      int64  `json:"amount"       binding:"required"`
-}
-
-type RetryMintRequest struct {
-	Expiration int64 `json:"expiration" binding:"required"`
+	UserID string `json:"user_id" binding:"required"`
+	BankTx string `json:"bank_tx" binding:"required"`
+	Amount int64  `json:"amount"  binding:"required"`
 }
 
 func (h *Handler) HandleDeposit(c *gin.Context) {
@@ -48,40 +44,41 @@ func (h *Handler) HandleDeposit(c *gin.Context) {
 		return
 	}
 
-	existing, err := h.stateDB.GetRequestByBankTx(req.BankTx)
+	user, err := h.stateDB.GetUserByID(req.UserID)
 	if err != nil {
-		log.Printf("[HandleDeposit] GetRequestByBankTx error: %v", err)
+		log.Printf("[HandleDeposit] GetUserByID error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 		return
 	}
-	if existing != nil {
-		log.Printf("[HandleDeposit] duplicate bank_tx=%s, existing requestID=%d", req.BankTx, existing.ID)
-		c.JSON(http.StatusConflict, gin.H{
-			"error":      "duplicate bank_tx",
-			"request_id": existing.ID,
-		})
+	if user == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user not found"})
 		return
 	}
 
 	record := &model.Request{
-		Type:        model.TypeMint,
-		Status:      model.StatusRequested,
-		RequesterID: req.RequesterID,
-		BankTx:      req.BankTx,
-		Amount:      req.Amount,
-		Timestamp:   time.Now().UnixMilli(),
+		Type:      model.TypeMint,
+		Status:    model.StatusRequested,
+		UserID:    user.UserID,
+		BankTx:    req.BankTx,
+		Amount:    req.Amount,
+		Timestamp: time.Now().UnixMilli(),
 	}
 	id, err := h.stateDB.InsertRequest(record)
 	if err != nil {
+		if errors.Is(err, db.ErrDuplicateBankTx) {
+			log.Printf("[HandleDeposit] duplicate bank_tx=%s", req.BankTx)
+			c.JSON(http.StatusConflict, gin.H{"error": "duplicate bank_tx"})
+			return
+		}
 		log.Printf("[HandleDeposit] InsertRequest error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 		return
 	}
 	record.ID = id
-	log.Printf("[HandleDeposit] inserted request id=%d status=REQUESTED", id)
+	log.Printf("[HandleDeposit] inserted request id=%d user_id=%s status=REQUESTED", id, user.UserID)
 
-	expiration := time.Now().Add(10 * time.Minute).Unix()
-	txHash, err := h.blockchain.SendMintTx(context.Background(), req.RequesterID, req.ToAddress, req.Amount, expiration)
+	expiration := time.Now().Add(model.MintExpiration).Unix()
+	txHash, err := h.blockchain.SendMintTx(context.Background(), user.UserID, user.Address, req.BankTx, req.Amount, expiration)
 	if err != nil {
 		log.Printf("[HandleDeposit] SendMintTx error: %v", err)
 		record.Status = model.StatusFailure
@@ -93,6 +90,7 @@ func (h *Handler) HandleDeposit(c *gin.Context) {
 
 	record.Status = model.StatusPending
 	record.TxHash = txHash
+	record.Expiration = expiration
 	if err := h.stateDB.UpdateRequest(record); err != nil {
 		log.Printf("[HandleDeposit] UpdateRequest error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
@@ -102,6 +100,7 @@ func (h *Handler) HandleDeposit(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"request_id": id,
+		"user_id":    user.UserID,
 		"tx_hash":    txHash,
 		"status":     "PENDING",
 	})
@@ -112,12 +111,6 @@ func (h *Handler) HandleRetryMint(c *gin.Context) {
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
-		return
-	}
-
-	var req RetryMintRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -135,16 +128,24 @@ func (h *Handler) HandleRetryMint(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "request is not a MINT type"})
 		return
 	}
-	if record.Status == model.StatusSuccess {
-		c.JSON(http.StatusConflict, gin.H{"error": "request already succeeded"})
-		return
-	}
-	if record.Status == model.StatusPending {
-		c.JSON(http.StatusConflict, gin.H{"error": "request is already pending"})
+	if record.Status != model.StatusFailure {
+		c.JSON(http.StatusConflict, gin.H{"error": "retry is only allowed for FAILURE status"})
 		return
 	}
 
-	txHash, err := h.blockchain.SendMintTx(context.Background(), record.RequesterID, "", record.Amount, req.Expiration)
+	user, err := h.stateDB.GetUserByID(record.UserID)
+	if err != nil {
+		log.Printf("[HandleRetryMint] GetUserByID error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+		return
+	}
+	if user == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user not found"})
+		return
+	}
+
+	expiration := time.Now().Add(model.MintExpiration).Unix()
+	txHash, err := h.blockchain.SendMintTx(context.Background(), user.UserID, user.Address, record.BankTx, record.Amount, expiration)
 	if err != nil {
 		log.Printf("[HandleRetryMint] SendMintTx error: %v", err)
 		record.Status = model.StatusFailure
@@ -156,6 +157,7 @@ func (h *Handler) HandleRetryMint(c *gin.Context) {
 
 	record.Status = model.StatusPending
 	record.TxHash = txHash
+	record.Expiration = expiration
 	record.ErrorCode = model.ErrorCodeNone
 	if err := h.stateDB.UpdateRequest(record); err != nil {
 		log.Printf("[HandleRetryMint] UpdateRequest error: %v", err)

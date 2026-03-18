@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.9;
 
 import {FiatToken} from "./FiatToken.sol";
 import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
@@ -89,13 +89,16 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
     function mintFromFiat(
         address _to,
         uint256 _amount,
+        uint256 _expiration,
         uint256 _txId) external onlyAdmin onlyAuthorized(_to) useTxId(_txId) {
+
+        require(block.timestamp < _expiration, "FiatManager: mint request expired");
 
         fiat.mint(_to, _amount);
 
         accumulatedMinted[_to] += _amount;
         totalAccumulatedMinted += _amount;
-        
+
         emit FiatTokenMinted(_txId, _to, _amount);
     }
 

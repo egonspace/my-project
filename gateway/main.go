@@ -28,7 +28,16 @@ func main() {
 	}
 	log.Println("[Main] StateDB connected")
 
-	bcClient := blockchain.NewStubClient(cfg.BlockchainRPCURL, cfg.FiatManagerAddr, cfg.AdminPrivateKey)
+	bcClient, err := blockchain.NewEthClient(
+		cfg.BlockchainRPCURL,
+		cfg.BlockchainWSURL,
+		cfg.FiatManagerAddr,
+		cfg.FiatTokenAddr,
+		cfg.AdminPrivateKey,
+	)
+	if err != nil {
+		log.Fatalf("failed to init blockchain client: %v", err)
+	}
 	fbClient := firmbanking.NewStubClient(cfg.FirmBankingURL)
 
 	ctx, cancel := context.WithCancel(context.Background())
