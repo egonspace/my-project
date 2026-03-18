@@ -19,9 +19,10 @@ import (
 
 // FiatManager ABI: mintFromFiat 함수 + FiatTokenMinted/FiatTokenBurnt 이벤트
 // 실제 컨트랙트 시그니처:
-//   mintFromFiat(address _to, uint256 _amount, uint256 _expiration, uint256 _txId)
-//   event FiatTokenMinted(uint256 indexed _txId, address indexed _minter, uint256 _amount)
-//   event FiatTokenBurnt(uint256 indexed _txId, address indexed _minter, uint256 _amount)
+//
+//	mintFromFiat(address _to, uint256 _amount, uint256 _expiration, uint256 _txId)
+//	event FiatTokenMinted(uint256 indexed _txId, address indexed _minter, uint256 _amount)
+//	event FiatTokenBurnt(uint256 indexed _txId, address indexed _minter, uint256 _amount)
 const fiatManagerABIJSON = `[
   {
     "name": "mintFromFiat",
@@ -56,11 +57,21 @@ const fiatManagerABIJSON = `[
   }
 ]`
 
+// FiatToken의 decimals() 조회에만 사용하는 최소 ABI
+const fiatTokenABIJSON = `[
+  {
+    "name": "decimals",
+    "type": "function",
+    "inputs": [],
+    "outputs": [{"name": "", "type": "uint8"}]
+  }
+]`
+
 type MintEvent struct {
 	TxHash      string
 	OnChainTxID string // 컨트랙트의 _txId (bankTx의 keccak256 해시)
 	To          string
-	Amount      int64
+	Amount      int64 // 원(KRW) 단위 — decimal 역변환 완료
 	BlockNumber uint64
 }
 
@@ -68,7 +79,7 @@ type BurnEvent struct {
 	TxHash      string
 	OnChainTxID string // 컨트랙트의 _txId
 	Burner      string
-	Amount      int64
+	Amount      int64 // 원(KRW) 단위 — decimal 역변환 완료
 	BlockNumber uint64
 }
 
@@ -79,15 +90,16 @@ type Client interface {
 }
 
 type EthClient struct {
-	rpcURL          string
-	wsURL           string
-	fiatManagerAddr common.Address
-	privateKey      *ecdsa.PrivateKey
-	chainID         *big.Int
-	fiatManagerABI  abi.ABI
+	rpcURL            string
+	wsURL             string
+	fiatManagerAddr   common.Address
+	privateKey        *ecdsa.PrivateKey
+	chainID           *big.Int
+	fiatManagerABI    abi.ABI
+	decimalMultiplier *big.Int // 10^tokenDecimal
 }
 
-func NewEthClient(rpcURL, wsURL, fiatManagerAddr, _ /* fiatTokenAddr */, privateKeyHex string) (*EthClient, error) {
+func NewEthClient(rpcURL, wsURL, fiatManagerAddr, fiatTokenAddr, privateKeyHex string) (*EthClient, error) {
 	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(privateKeyHex, "0x"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid private key: %w", err)
@@ -96,6 +108,11 @@ func NewEthClient(rpcURL, wsURL, fiatManagerAddr, _ /* fiatTokenAddr */, private
 	fiatManagerABI, err := abi.JSON(strings.NewReader(fiatManagerABIJSON))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse FiatManager ABI: %w", err)
+	}
+
+	fiatTokenABI, err := abi.JSON(strings.NewReader(fiatTokenABIJSON))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse FiatToken ABI: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -112,14 +129,55 @@ func NewEthClient(rpcURL, wsURL, fiatManagerAddr, _ /* fiatTokenAddr */, private
 		return nil, fmt.Errorf("failed to get chainID: %w", err)
 	}
 
+	// FiatToken 컨트랙트에서 decimal 조회
+	tokenAddr := common.HexToAddress(fiatTokenAddr)
+	decimalMultiplier, err := fetchDecimalMultiplier(ctx, httpClient, tokenAddr, fiatTokenABI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch token decimals: %w", err)
+	}
+	log.Printf("[Blockchain] FiatToken decimals fetched: multiplier=%s", decimalMultiplier.String())
+
 	return &EthClient{
-		rpcURL:          rpcURL,
-		wsURL:           wsURL,
-		fiatManagerAddr: common.HexToAddress(fiatManagerAddr),
-		privateKey:      privateKey,
-		chainID:         chainID,
-		fiatManagerABI:  fiatManagerABI,
+		rpcURL:            rpcURL,
+		wsURL:             wsURL,
+		fiatManagerAddr:   common.HexToAddress(fiatManagerAddr),
+		privateKey:        privateKey,
+		chainID:           chainID,
+		fiatManagerABI:    fiatManagerABI,
+		decimalMultiplier: decimalMultiplier,
 	}, nil
+}
+
+// fetchDecimalMultiplier는 토큰 컨트랙트의 decimals()를 호출해 10^decimal 을 반환합니다.
+func fetchDecimalMultiplier(ctx context.Context, client *ethclient.Client, tokenAddr common.Address, tokenABI abi.ABI) (*big.Int, error) {
+	callData, err := tokenABI.Pack("decimals")
+	if err != nil {
+		return nil, fmt.Errorf("pack decimals call: %w", err)
+	}
+
+	result, err := client.CallContract(ctx, ethereum.CallMsg{
+		To:   &tokenAddr,
+		Data: callData,
+	}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("call decimals: %w", err)
+	}
+
+	vals, err := tokenABI.Unpack("decimals", result)
+	if err != nil {
+		return nil, fmt.Errorf("unpack decimals: %w", err)
+	}
+	if len(vals) == 0 {
+		return nil, fmt.Errorf("decimals returned empty result")
+	}
+
+	decimal, ok := vals[0].(uint8)
+	if !ok {
+		return nil, fmt.Errorf("decimals: unexpected type %T", vals[0])
+	}
+
+	multiplier := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimal)), nil)
+	return multiplier, nil
 }
 
 // bankTxToTxID는 string 타입의 bankTx를 컨트랙트의 uint256 _txId로 변환합니다.
@@ -127,6 +185,18 @@ func NewEthClient(rpcURL, wsURL, fiatManagerAddr, _ /* fiatTokenAddr */, private
 func bankTxToTxID(bankTx string) *big.Int {
 	hash := crypto.Keccak256([]byte(bankTx))
 	return new(big.Int).SetBytes(hash)
+}
+
+// toContractAmount는 원(KRW) 단위 금액을 컨트랙트 토큰 단위로 변환합니다.
+// contractAmount = bankAmount × 10^decimal
+func (c *EthClient) toContractAmount(bankAmount int64) *big.Int {
+	return new(big.Int).Mul(big.NewInt(bankAmount), c.decimalMultiplier)
+}
+
+// toBankAmount는 컨트랙트 토큰 단위 금액을 원(KRW) 단위로 역변환합니다.
+// bankAmount = contractAmount / 10^decimal
+func (c *EthClient) toBankAmount(contractAmount *big.Int) int64 {
+	return new(big.Int).Div(contractAmount, c.decimalMultiplier).Int64()
 }
 
 func (c *EthClient) SendMintTx(ctx context.Context, _ string, toAddress string, bankTx string, amount int64, expiration int64) (string, error) {
@@ -139,8 +209,9 @@ func (c *EthClient) SendMintTx(ctx context.Context, _ string, toAddress string, 
 	fromAddr := crypto.PubkeyToAddress(c.privateKey.PublicKey)
 	toAddr := common.HexToAddress(toAddress)
 	txID := bankTxToTxID(bankTx)
+	contractAmount := c.toContractAmount(amount) // 원 → 토큰 단위
 
-	data, err := c.fiatManagerABI.Pack("mintFromFiat", toAddr, big.NewInt(amount), big.NewInt(expiration), txID)
+	data, err := c.fiatManagerABI.Pack("mintFromFiat", toAddr, contractAmount, big.NewInt(expiration), txID)
 	if err != nil {
 		return "", fmt.Errorf("abi pack failed: %w", err)
 	}
@@ -170,7 +241,7 @@ func (c *EthClient) SendMintTx(ctx context.Context, _ string, toAddress string, 
 	}
 
 	txHash := signedTx.Hash().Hex()
-	log.Printf("[Blockchain] SendMintTx submitted txHash=%s to=%s amount=%d", txHash, toAddress, amount)
+	log.Printf("[Blockchain] SendMintTx submitted txHash=%s to=%s amount=%d (contractAmount=%s)", txHash, toAddress, amount, contractAmount.String())
 	return txHash, nil
 }
 
@@ -321,7 +392,7 @@ func (c *EthClient) parseMintLog(l types.Log) (*MintEvent, error) {
 		TxHash:      l.TxHash.Hex(),
 		OnChainTxID: txID.String(),
 		To:          common.BytesToAddress(l.Topics[2].Bytes()).Hex(),
-		Amount:      data.Amount.Int64(),
+		Amount:      c.toBankAmount(data.Amount), // 토큰 단위 → 원(KRW)
 		BlockNumber: l.BlockNumber,
 	}, nil
 }
@@ -340,7 +411,7 @@ func (c *EthClient) parseBurnLog(l types.Log) (*BurnEvent, error) {
 		TxHash:      l.TxHash.Hex(),
 		OnChainTxID: txID.String(),
 		Burner:      common.BytesToAddress(l.Topics[2].Bytes()).Hex(),
-		Amount:      data.Amount.Int64(),
+		Amount:      c.toBankAmount(data.Amount), // 토큰 단위 → 원(KRW)
 		BlockNumber: l.BlockNumber,
 	}, nil
 }
