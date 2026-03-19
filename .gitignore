@@ -4,4 +4,5 @@ contracts/cache/
 contracts/typechain-types/
 contracts/coverage/
 contracts/coverage.json
+gateway/gateway
 .idea/

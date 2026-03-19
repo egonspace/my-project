@@ -38,7 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to init blockchain client: %v", err)
 	}
-	fbClient := firmbanking.NewStubClient(cfg.FirmBankingURL)
+	fbClient := firmbanking.NewHttpClient(cfg.FirmBankingURL)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

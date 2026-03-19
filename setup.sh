@@ -32,23 +32,13 @@ if ! command -v brew &>/dev/null; then
   die "Homebrew가 설치되어 있지 않습니다. https://brew.sh 에서 먼저 설치해주세요."
 fi
 
-# 설치된 postgresql 버전 감지 (postgresql@15, postgresql@16 등)
-PG_FORMULA=$(brew list --formula 2>/dev/null | grep -E '^postgresql(@[0-9]+)?$' | tail -1)
+PG_FORMULA="postgresql@15"
 
-if [[ -z "$PG_FORMULA" ]]; then
-  echo "  PostgreSQL 설치 중 (postgresql@15)..."
-  brew install postgresql@15
-  PG_FORMULA="postgresql@15"
-  # PATH에 psql 추가
-  export PATH="$(brew --prefix $PG_FORMULA)/bin:$PATH"
-else
-  ok "이미 설치됨: $PG_FORMULA"
-fi
+echo "  PostgreSQL 설치 중 ($PG_FORMULA)..."
+brew install "$PG_FORMULA" || true
 
-# psql이 PATH에 없으면 추가
-if ! command -v psql &>/dev/null; then
-  export PATH="$(brew --prefix $PG_FORMULA)/bin:$PATH"
-fi
+# PATH에 psql 추가
+export PATH="$(brew --prefix $PG_FORMULA)/bin:$PATH"
 
 # 서비스 시작
 brew services start "$PG_FORMULA" &>/dev/null || true
@@ -103,9 +93,10 @@ ok "컴파일 완료"
 # ──────────────────────────────────────────────────────────────────
 step "4/5" "컨트랙트 배포"
 
-DEPLOY_PRIVATE_KEY=$(grep 'AdminPrivateKey' "$GATEWAY_CONFIG" \
+# 값 할당 라인만 매칭 (필드 선언 라인 제외하기 위해 ':' 포함)
+DEPLOY_PRIVATE_KEY=$(grep 'AdminPrivateKey:' "$GATEWAY_CONFIG" \
   | sed 's/.*"\(0x[^"]*\)".*/\1/')
-DEPLOY_RPC_URL=$(grep 'BlockchainRPCURL' "$GATEWAY_CONFIG" \
+DEPLOY_RPC_URL=$(grep 'BlockchainRPCURL:' "$GATEWAY_CONFIG" \
   | sed 's/.*"\([^"]*\)".*/\1/')
 
 if [[ -z "$DEPLOY_PRIVATE_KEY" ]]; then
