@@ -273,8 +273,7 @@ func (s *StateDB) UpsertLastBlock(key string, block uint64) error {
 	return nil
 }
 
-// GetStaleMintRequests returns MINT requests that are still REQUESTED or PENDING
-// but whose on-chain expiration has already passed.
+// GetStaleMintRequests returns MINT PENDING requests whose expiration has passed.
 func (s *StateDB) GetStaleMintRequests(nowUnix int64) ([]*model.Request, error) {
 	query := `
 		SELECT id, type, status, user_id, COALESCE(bank_tx, ''), tx_hash, timestamp, expiration, amount, error_code
@@ -298,6 +297,36 @@ func (s *StateDB) GetStaleMintRequests(nowUnix int64) ([]*model.Request, error) 
 			&req.BankTx, &req.TxHash, &req.Timestamp, &req.Expiration, &req.Amount, &req.ErrorCode,
 		); err != nil {
 			return nil, fmt.Errorf("GetStaleMintRequests scan failed: %w", err)
+		}
+		results = append(results, req)
+	}
+	return results, rows.Err()
+}
+
+// GetStaleBurnRequests returns BURN REQUESTED requests whose expiration has passed.
+func (s *StateDB) GetStaleBurnRequests(nowUnix int64) ([]*model.Request, error) {
+	query := `
+		SELECT id, type, status, user_id, COALESCE(bank_tx, ''), tx_hash, timestamp, expiration, amount, error_code
+		FROM requests
+		WHERE type       = $1
+		  AND status     = $2
+		  AND expiration > 0
+		  AND expiration < $3
+	`
+	rows, err := s.db.Query(query, model.TypeBurn, model.StatusRequested, nowUnix)
+	if err != nil {
+		return nil, fmt.Errorf("GetStaleBurnRequests failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*model.Request
+	for rows.Next() {
+		req := &model.Request{}
+		if err := rows.Scan(
+			&req.ID, &req.Type, &req.Status, &req.UserID,
+			&req.BankTx, &req.TxHash, &req.Timestamp, &req.Expiration, &req.Amount, &req.ErrorCode,
+		); err != nil {
+			return nil, fmt.Errorf("GetStaleBurnRequests scan failed: %w", err)
 		}
 		results = append(results, req)
 	}

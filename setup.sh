@@ -26,7 +26,7 @@ die()  { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 # ──────────────────────────────────────────────────────────────────
 # 1. PostgreSQL 설치 및 서비스 시작
 # ──────────────────────────────────────────────────────────────────
-step "1/5" "PostgreSQL 설치 및 서비스 시작"
+step "1/6" "PostgreSQL 설치 및 서비스 시작"
 
 if ! command -v brew &>/dev/null; then
   die "Homebrew가 설치되어 있지 않습니다. https://brew.sh 에서 먼저 설치해주세요."
@@ -56,7 +56,7 @@ ok "PostgreSQL 실행 중"
 # ──────────────────────────────────────────────────────────────────
 # 2. DB 유저 및 데이터베이스 생성
 # ──────────────────────────────────────────────────────────────────
-step "2/5" "DB 유저(gateway) 및 데이터베이스(gateway) 생성"
+step "2/6" "DB 유저(gateway) 및 데이터베이스(gateway) 생성"
 
 # 유저 생성 (이미 있으면 무시)
 psql postgres -tc "SELECT 1 FROM pg_roles WHERE rolname='gateway'" \
@@ -73,7 +73,7 @@ psql postgres -tc "SELECT 1 FROM pg_database WHERE datname='gateway'" \
 # ──────────────────────────────────────────────────────────────────
 # 3. 컨트랙트 의존성 설치 및 컴파일
 # ──────────────────────────────────────────────────────────────────
-step "3/5" "컨트랙트 의존성 설치 및 컴파일"
+step "3/6" "컨트랙트 의존성 설치 및 컴파일"
 
 cd "$CONTRACTS_DIR"
 
@@ -91,7 +91,7 @@ ok "컴파일 완료"
 # ──────────────────────────────────────────────────────────────────
 # 4. config.go에서 배포 설정 읽기
 # ──────────────────────────────────────────────────────────────────
-step "4/5" "컨트랙트 배포"
+step "4/6" "컨트랙트 배포"
 
 # 값 할당 라인만 매칭 (필드 선언 라인 제외하기 위해 ':' 포함)
 DEPLOY_PRIVATE_KEY=$(grep 'AdminPrivateKey:' "$GATEWAY_CONFIG" \
@@ -129,7 +129,7 @@ fi
 # ──────────────────────────────────────────────────────────────────
 # 5. config.go 컨트랙트 주소 자동 업데이트
 # ──────────────────────────────────────────────────────────────────
-step "5/5" "config.go 컨트랙트 주소 업데이트"
+step "5/6" "config.go 컨트랙트 주소 업데이트"
 
 # macOS sed는 -i '' 필요
 sed -i '' \
@@ -143,15 +143,47 @@ sed -i '' \
 ok "config.go 업데이트 완료"
 
 # ──────────────────────────────────────────────────────────────────
+# 6. 샘플 유저 DB 등록
+# ──────────────────────────────────────────────────────────────────
+step "6/6" "샘플 유저 DB 등록"
+
+SAMPLE_USER_ID=$(grep 'SampleUserID:'    "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+SAMPLE_ADDRESS=$(grep 'SampleAddress:'   "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+SAMPLE_ACCOUNT=$(grep 'SampleAccountNo:' "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+
+PG_DSN="host=localhost port=5432 user=gateway password=secret dbname=gateway sslmode=disable"
+
+# users 테이블 생성 (없으면)
+psql "$PG_DSN" <<SQL
+CREATE TABLE IF NOT EXISTS users (
+    user_id    VARCHAR(255) PRIMARY KEY,
+    address    VARCHAR(255) NOT NULL UNIQUE,
+    account_no VARCHAR(255) NOT NULL
+);
+SQL
+
+# 샘플 유저 INSERT (이미 있으면 무시)
+psql "$PG_DSN" -c \
+  "INSERT INTO users (user_id, address, account_no)
+   VALUES ('$SAMPLE_USER_ID', '$SAMPLE_ADDRESS', '$SAMPLE_ACCOUNT')
+   ON CONFLICT (user_id) DO NOTHING;"
+
+ok "샘플 유저 등록 완료 (user_id=$SAMPLE_USER_ID)"
+
+# ──────────────────────────────────────────────────────────────────
 # 완료 요약
 # ──────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}════════════════════════════════════════${NC}"
 echo -e "${GREEN}  셋업 완료!${NC}"
 echo -e "${GREEN}════════════════════════════════════════${NC}"
-echo -e "  PostgreSQL DB  : gateway (user: gateway / pw: secret)"
+echo -e "  PostgreSQL DB    : gateway (user: gateway / pw: secret)"
 echo -e "  FiatManagerProxy : ${CYAN}$FIAT_MANAGER_PROXY${NC}"
 echo -e "  FiatToken        : ${CYAN}$FIAT_TOKEN${NC}"
+echo -e "  샘플 유저"
+echo -e "    user_id    : ${CYAN}$SAMPLE_USER_ID${NC}"
+echo -e "    address    : ${CYAN}$SAMPLE_ADDRESS${NC}"
+echo -e "    account_no : ${CYAN}$SAMPLE_ACCOUNT${NC}"
 echo ""
 echo -e "  게이트웨이 서버 실행:"
 echo -e "  ${YELLOW}cd gateway && go run .${NC}"

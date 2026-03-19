@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"gateway/blockchain"
 	"gateway/db"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -170,6 +172,84 @@ func (h *Handler) HandleRetryMint(c *gin.Context) {
 		"request_id": id,
 		"tx_hash":    txHash,
 		"status":     "PENDING",
+	})
+}
+
+type WithdrawalRequest struct {
+	UserID          string `json:"user_id"          binding:"required"`
+	Amount          int64  `json:"amount"           binding:"required"`
+	PermitDeadline  int64  `json:"permit_deadline"  binding:"required"`
+	PermitSignature string `json:"permit_signature" binding:"required"` // 0x 포함 hex 문자열
+}
+
+func (h *Handler) HandleWithdraw(c *gin.Context) {
+	var req WithdrawalRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Amount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be greater than 0"})
+		return
+	}
+
+	// permit_signature: "0x..." hex → []byte
+	sigHex := strings.TrimPrefix(req.PermitSignature, "0x")
+	permitSig, err := hex.DecodeString(sigHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid permit_signature: " + err.Error()})
+		return
+	}
+
+	user, err := h.stateDB.GetUserByID(req.UserID)
+	if err != nil {
+		log.Printf("[HandleWithdraw] GetUserByID error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+		return
+	}
+	if user == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user not found"})
+		return
+	}
+
+	// burnForFiat 트랜잭션 전송
+	expiration := time.Now().Add(model.BurnExpiration).Unix()
+	txHash, err := h.blockchain.SendBurnTx(context.Background(), user.Address, req.Amount, expiration, req.PermitDeadline, permitSig)
+	if err != nil {
+		log.Printf("[HandleWithdraw] SendBurnTx error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "blockchain tx failed"})
+		return
+	}
+
+	// tx 전송 성공 → REQUESTED 상태로 기록
+	record := &model.Request{
+		Type:       model.TypeBurn,
+		Status:     model.StatusRequested,
+		UserID:     user.UserID,
+		TxHash:     txHash,
+		Amount:     req.Amount,
+		Expiration: expiration,
+		Timestamp:  time.Now().UnixMilli(),
+	}
+	id, err := h.stateDB.InsertRequest(record)
+	if err != nil {
+		if errors.Is(err, db.ErrDuplicateTxHash) {
+			log.Printf("[HandleWithdraw] duplicate txHash=%s", txHash)
+			c.JSON(http.StatusConflict, gin.H{"error": "duplicate tx"})
+			return
+		}
+		log.Printf("[HandleWithdraw] InsertRequest error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+		return
+	}
+	log.Printf("[HandleWithdraw] inserted burn request id=%d user_id=%s txHash=%s status=REQUESTED", id, user.UserID, txHash)
+
+	c.JSON(http.StatusOK, gin.H{
+		"request_id": id,
+		"user_id":    user.UserID,
+		"tx_hash":    txHash,
+		"status":     "REQUESTED",
 	})
 }
 

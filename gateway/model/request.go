@@ -3,6 +3,7 @@ package model
 import "time"
 
 const MintExpiration = 3 * time.Minute
+const BurnExpiration = 3 * time.Minute
 
 const (
 	TypeMint = 1

@@ -20,6 +20,7 @@ func NewServer(stateDB *db.StateDB, bc blockchain.Client) *Server {
 	{
 		v1.POST("/deposit", handler.HandleDeposit)
 		v1.POST("/mint/:id/retry", handler.HandleRetryMint)
+		v1.POST("/withdraw", handler.HandleWithdraw)
 		v1.GET("/request/:id", handler.HandleGetRequest)
 	}
 

@@ -36,6 +36,18 @@ const fiatManagerABIJSON = `[
     "outputs": []
   },
   {
+    "name": "burnForFiat",
+    "type": "function",
+    "inputs": [
+      {"name": "_owner",           "type": "address"},
+      {"name": "_amount",          "type": "uint256"},
+      {"name": "_expiration",      "type": "uint256"},
+      {"name": "_permitDeadline",  "type": "uint256"},
+      {"name": "_permitSignature", "type": "bytes"}
+    ],
+    "outputs": []
+  },
+  {
     "name": "FiatTokenMinted",
     "type": "event",
     "anonymous": false,
@@ -83,6 +95,7 @@ type BurnEvent struct {
 
 type Client interface {
 	SendMintTx(ctx context.Context, requesterID string, toAddress string, bankTx string, amount int64, expiration int64) (string, error)
+	SendBurnTx(ctx context.Context, ownerAddress string, amount int64, expiration int64, permitDeadline int64, permitSig []byte) (string, error)
 	// fromBlock: 0이면 현재 시점부터 구독, >0이면 해당 블록부터 히스토리 스캔 후 구독
 	SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent, fromBlock uint64) error
 	SubscribeBurnEvents(ctx context.Context, ch chan<- BurnEvent, fromBlock uint64) error
@@ -285,6 +298,52 @@ func (c *EthClient) buildAndSignTx(ctx context.Context, client *ethclient.Client
 		return nil, fmt.Errorf("sign tx failed: %w", err)
 	}
 	return signedTx, nil
+}
+
+func (c *EthClient) SendBurnTx(ctx context.Context, ownerAddress string, amount int64, expiration int64, permitDeadline int64, permitSig []byte) (string, error) {
+	client, err := ethclient.DialContext(ctx, c.rpcURL)
+	if err != nil {
+		return "", fmt.Errorf("dial failed: %w", err)
+	}
+	defer client.Close()
+
+	fromAddr := crypto.PubkeyToAddress(c.privateKey.PublicKey)
+	ownerAddr := common.HexToAddress(ownerAddress)
+	contractAmount := c.toContractAmount(amount) // 원 → 토큰 단위
+
+	data, err := c.fiatManagerABI.Pack("burnForFiat", ownerAddr, contractAmount, big.NewInt(expiration), big.NewInt(permitDeadline), permitSig)
+	if err != nil {
+		return "", fmt.Errorf("abi pack failed: %w", err)
+	}
+
+	nonce, err := client.PendingNonceAt(ctx, fromAddr)
+	if err != nil {
+		return "", fmt.Errorf("get nonce failed: %w", err)
+	}
+
+	gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{
+		From: fromAddr,
+		To:   &c.fiatManagerAddr,
+		Data: data,
+	})
+	if err != nil {
+		log.Printf("[Blockchain] SendBurnTx EstimateGas failed (using fallback 200000): %v", err)
+		gasLimit = 200000
+	}
+
+	signedTx, err := c.buildAndSignTx(ctx, client, nonce, &c.fiatManagerAddr, big.NewInt(0), gasLimit, data)
+	if err != nil {
+		return "", err
+	}
+
+	if err := client.SendTransaction(ctx, signedTx); err != nil {
+		return "", fmt.Errorf("send tx failed: %w", err)
+	}
+
+	txHash := signedTx.Hash().Hex()
+	log.Printf("[Blockchain] SendBurnTx submitted txHash=%s owner=%s amount=%d (contractAmount=%s)",
+		txHash, ownerAddress, amount, contractAmount.String())
+	return txHash, nil
 }
 
 func (c *EthClient) SubscribeMintEvents(ctx context.Context, ch chan<- MintEvent, fromBlock uint64) error {

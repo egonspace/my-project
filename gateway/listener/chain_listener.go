@@ -2,7 +2,6 @@ package listener
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"gateway/blockchain"
 	"gateway/db"
@@ -136,24 +135,39 @@ func (l *ChainListener) runRetryPoller(ctx context.Context) {
 
 func (l *ChainListener) timeoutStaleRequests() {
 	now := time.Now().Unix()
-	records, err := l.stateDB.GetStaleMintRequests(now)
+
+	// MINT: PENDING 상태 중 expiration 초과
+	mintRecords, err := l.stateDB.GetStaleMintRequests(now)
 	if err != nil {
 		log.Printf("[ChainListener] GetStaleMintRequests error: %v", err)
-		return
-	}
-	if len(records) == 0 {
-		return
-	}
-	log.Printf("[ChainListener] retryPoller found %d timed-out mint request(s)", len(records))
-
-	for _, record := range records {
-		record.Status = model.StatusFailure
-		record.ErrorCode = model.ErrorCodeTxTimeout
-		if err := l.stateDB.UpdateRequest(record); err != nil {
-			log.Printf("[ChainListener] retryPoller UpdateRequest failed id=%d: %v", record.ID, err)
-			continue
+	} else if len(mintRecords) > 0 {
+		log.Printf("[ChainListener] retryPoller found %d timed-out mint request(s)", len(mintRecords))
+		for _, record := range mintRecords {
+			record.Status = model.StatusFailure
+			record.ErrorCode = model.ErrorCodeTxTimeout
+			if err := l.stateDB.UpdateRequest(record); err != nil {
+				log.Printf("[ChainListener] retryPoller UpdateRequest failed id=%d: %v", record.ID, err)
+				continue
+			}
+			log.Printf("[ChainListener] retryPoller mint timed out id=%d", record.ID)
 		}
-		log.Printf("[ChainListener] retryPoller timed out id=%d", record.ID)
+	}
+
+	// BURN: REQUESTED 상태 중 expiration 초과
+	burnRecords, err := l.stateDB.GetStaleBurnRequests(now)
+	if err != nil {
+		log.Printf("[ChainListener] GetStaleBurnRequests error: %v", err)
+	} else if len(burnRecords) > 0 {
+		log.Printf("[ChainListener] retryPoller found %d timed-out burn request(s)", len(burnRecords))
+		for _, record := range burnRecords {
+			record.Status = model.StatusFailure
+			record.ErrorCode = model.ErrorCodeTxTimeout
+			if err := l.stateDB.UpdateRequest(record); err != nil {
+				log.Printf("[ChainListener] retryPoller UpdateRequest failed id=%d: %v", record.ID, err)
+				continue
+			}
+			log.Printf("[ChainListener] retryPoller burn timed out id=%d", record.ID)
+		}
 	}
 }
 
@@ -161,44 +175,48 @@ func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 	log.Printf("[ChainListener] BurnEvent received txHash=%s burner=%s amount=%d",
 		event.TxHash, event.Burner, event.Amount)
 
-	user, err := l.stateDB.GetUserByAddress(event.Burner)
+	// HandleWithdraw에서 tx 전송 후 REQUESTED 상태로 미리 삽입된 record를 조회
+	record, err := l.stateDB.GetRequestByTxHash(event.TxHash)
 	if err != nil {
-		log.Printf("[ChainListener] handleBurnEvent GetUserByAddress error: %v", err)
+		log.Printf("[ChainListener] handleBurnEvent GetRequestByTxHash error: %v", err)
+		return
+	}
+	if record == nil {
+		log.Printf("[ChainListener] handleBurnEvent no request found for txHash=%s (unexpected burn?)", event.TxHash)
+		l.saveLastBlock(event.BlockNumber)
+		return
+	}
+	if record.Status == model.StatusSuccess {
+		log.Printf("[ChainListener] handleBurnEvent already succeeded id=%d", record.ID)
+		l.saveLastBlock(event.BlockNumber)
+		return
+	}
+
+	// 이벤트 확인 → PENDING으로 전환
+	record.Status = model.StatusPending
+	if err := l.stateDB.UpdateRequest(record); err != nil {
+		log.Printf("[ChainListener] handleBurnEvent UpdateRequest(PENDING) error: %v", err)
+		return
+	}
+	log.Printf("[ChainListener] BurnEvent confirmed id=%d status=PENDING", record.ID)
+
+	// 사용자 계좌 조회
+	user, err := l.stateDB.GetUserByID(record.UserID)
+	if err != nil {
+		log.Printf("[ChainListener] handleBurnEvent GetUserByID error: %v", err)
 		return
 	}
 	if user == nil {
-		log.Printf("[ChainListener] handleBurnEvent no user found for address=%s", event.Burner)
+		log.Printf("[ChainListener] handleBurnEvent user not found userID=%s", record.UserID)
 		return
 	}
 
-	record := &model.Request{
-		Type:      model.TypeBurn,
-		Status:    model.StatusRequested,
-		UserID:    user.UserID,
-		TxHash:    event.TxHash,
-		Amount:    event.Amount,
-		Timestamp: time.Now().UnixMilli(),
-	}
-	id, err := l.stateDB.InsertRequest(record)
-	if err != nil {
-		if errors.Is(err, db.ErrDuplicateTxHash) {
-			log.Printf("[ChainListener] handleBurnEvent duplicate txHash=%s, skipping", event.TxHash)
-			l.saveLastBlock(event.BlockNumber)
-			return
-		}
-		log.Printf("[ChainListener] handleBurnEvent InsertRequest error: %v", err)
-		return
-	}
-	record.ID = id
-	log.Printf("[ChainListener] BurnEvent inserted request id=%d user_id=%s status=REQUESTED", id, user.UserID)
-
+	// 은행 송금
 	transferReq := &firmbanking.TransferRequest{
 		ToAccountNo: user.AccountNo,
 		Amount:      event.Amount,
 		RefID:       event.TxHash,
 	}
-	// firmBanking.Transfer는 동기방식으로 트랜잭셔널하게 처리된다고 가정
-	// 만약 비동기로 진행된다면 Status의 세분화 필요함 (예: PENDING -> SUCCESS/FAILURE)
 	if err := l.firmBanking.Transfer(transferReq); err != nil {
 		log.Printf("[ChainListener] handleBurnEvent Transfer error: %v", err)
 		record.Status = model.StatusFailure
@@ -209,10 +227,10 @@ func (l *ChainListener) handleBurnEvent(event blockchain.BurnEvent) {
 
 	record.Status = model.StatusSuccess
 	if err := l.stateDB.UpdateRequest(record); err != nil {
-		log.Printf("[ChainListener] handleBurnEvent UpdateRequest error: %v", err)
+		log.Printf("[ChainListener] handleBurnEvent UpdateRequest(SUCCESS) error: %v", err)
 		return
 	}
-	log.Printf("[ChainListener] BurnEvent completed id=%d status=SUCCESS", id)
+	log.Printf("[ChainListener] BurnEvent completed id=%d status=SUCCESS", record.ID)
 	l.saveLastBlock(event.BlockNumber)
 }
 
