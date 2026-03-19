@@ -22,5 +22,12 @@ module.exports = {
     localhost: {
       url: "http://127.0.0.1:8545",
     },
+    // setup.sh가 환경변수로 주입: DEPLOY_RPC_URL, DEPLOY_PRIVATE_KEY
+    stablenet: {
+      url: process.env.DEPLOY_RPC_URL || "",
+      accounts: process.env.DEPLOY_PRIVATE_KEY
+        ? [process.env.DEPLOY_PRIVATE_KEY]
+        : [],
+    },
   },
 };
