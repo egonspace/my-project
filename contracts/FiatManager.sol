@@ -110,9 +110,11 @@ contract FiatManager is OwnableUpgradeable, UUPSUpgradeable {
     function burnForFiat(
         address _owner,
         uint256 _amount,
+        uint256 _expiration,
         uint256 _permitDeadline,
         bytes memory _permitSignature) external onlyAdmin onlyAuthorized(_owner) {
 
+        require(block.timestamp < _expiration, "FiatManager: burn request expired");
         require(_amount % (10**fiat.decimals()) == 0, "FiatGateway: only whole token amounts can be burned");
 
         fiat.permit(_owner, address(this), _amount, _permitDeadline, _permitSignature);

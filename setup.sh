@@ -18,6 +18,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRACTS_DIR="$SCRIPT_DIR/contracts"
 GATEWAY_CONFIG="$SCRIPT_DIR/gateway/config/config.go"
 
+# --no_deploy 플래그: 기존 컨트랙트 주소가 온체인에 있으면 배포 건너뜀
+NO_DEPLOY=false
+for arg in "$@"; do
+  [[ "$arg" == "--no_deploy" ]] && NO_DEPLOY=true
+done
+
 step() { echo -e "\n${CYAN}[$1]${NC} $2"; }
 ok()   { echo -e "${GREEN}  ✓ $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
@@ -89,7 +95,7 @@ npx hardhat compile --quiet
 ok "컴파일 완료"
 
 # ──────────────────────────────────────────────────────────────────
-# 4. config.go에서 배포 설정 읽기
+# 4. 컨트랙트 배포
 # ──────────────────────────────────────────────────────────────────
 step "4/6" "컨트랙트 배포"
 
@@ -107,24 +113,87 @@ if [[ -z "$DEPLOY_RPC_URL" ]]; then
 fi
 
 echo "  RPC URL: $DEPLOY_RPC_URL"
-echo "  배포 계정: (config.go AdminPrivateKey)"
 echo ""
 
-# 배포 실행
-DEPLOY_OUTPUT=$(
+# eth_getCode로 컨트랙트 배포 여부 확인
+# 반환값이 "0x" 이면 배포 안 된 것, 그 외이면 배포된 것
+has_contract() {
+  local addr="$1"
+  local code
+  code=$(curl -s -X POST "$DEPLOY_RPC_URL" \
+    -H "Content-Type: application/json" \
+    -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getCode\",\"params\":[\"$addr\",\"latest\"],\"id\":1}" \
+    | grep -o '"result":"[^"]*"' | cut -d'"' -f4)
+  [[ -n "$code" && "$code" != "0x" ]]
+}
+
+CURRENT_FIAT_MANAGER=$(grep 'FiatManagerAddr:' "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+CURRENT_FIAT_TOKEN=$(grep 'FiatTokenAddr:'    "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+
+if [[ "$NO_DEPLOY" == true ]] && has_contract "$CURRENT_FIAT_MANAGER" && has_contract "$CURRENT_FIAT_TOKEN"; then
+  warn "--no_deploy: 컨트랙트가 이미 배포되어 있습니다. 배포 건너뜀."
+  warn "  FiatManagerProxy : $CURRENT_FIAT_MANAGER"
+  warn "  FiatToken        : $CURRENT_FIAT_TOKEN"
+  FIAT_MANAGER_PROXY="$CURRENT_FIAT_MANAGER"
+  FIAT_TOKEN="$CURRENT_FIAT_TOKEN"
+else
+  if [[ "$NO_DEPLOY" == true ]]; then
+    warn "--no_deploy 지정됐지만 기존 컨트랙트가 없습니다. 새로 배포합니다."
+  fi
+  echo "  배포 계정: (config.go AdminPrivateKey)"
+  echo ""
+
+  # 배포 실행 — 실시간 출력하면서 결과도 파일에 저장
+  _DEPLOY_TMP=$(mktemp)
+  set +e
   DEPLOY_PRIVATE_KEY="$DEPLOY_PRIVATE_KEY" \
   DEPLOY_RPC_URL="$DEPLOY_RPC_URL" \
-  npx hardhat run scripts/deploy.js --network stablenet 2>&1
-)
-echo "$DEPLOY_OUTPUT"
+  npx hardhat run scripts/deploy.js --network stablenet 2>&1 | tee "$_DEPLOY_TMP"
+  _DEPLOY_EXIT=${PIPESTATUS[0]}
+  set -e
 
-# 결과에서 주소 파싱
-FIAT_MANAGER_PROXY=$(echo "$DEPLOY_OUTPUT" | grep '^FIAT_MANAGER_PROXY=' | cut -d= -f2 | tr -d '[:space:]')
-FIAT_TOKEN=$(echo "$DEPLOY_OUTPUT"         | grep '^FIAT_TOKEN='         | cut -d= -f2 | tr -d '[:space:]')
+  if [[ $_DEPLOY_EXIT -ne 0 ]]; then
+    rm -f "$_DEPLOY_TMP"
+    die "컨트랙트 배포 실패 (exit $_DEPLOY_EXIT). 위 로그를 확인해주세요."
+  fi
 
-if [[ -z "$FIAT_MANAGER_PROXY" || -z "$FIAT_TOKEN" ]]; then
-  die "배포 결과에서 컨트랙트 주소를 파싱할 수 없습니다. 위 로그를 확인해주세요."
+  # 결과에서 주소 파싱
+  FIAT_MANAGER_PROXY=$(grep '^FIAT_MANAGER_PROXY=' "$_DEPLOY_TMP" | cut -d= -f2 | tr -d '[:space:]')
+  FIAT_TOKEN=$(grep         '^FIAT_TOKEN='         "$_DEPLOY_TMP" | cut -d= -f2 | tr -d '[:space:]')
+  rm -f "$_DEPLOY_TMP"
+
+  if [[ -z "$FIAT_MANAGER_PROXY" || -z "$FIAT_TOKEN" ]]; then
+    die "배포 결과에서 컨트랙트 주소를 파싱할 수 없습니다. 위 로그를 확인해주세요."
+  fi
 fi
+
+# 샘플 유저 authorize (authorized 여부 확인 후 필요한 경우에만 실행)
+SAMPLE_ADDRESS_FOR_AUTH=$(grep 'SampleAddress:' "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+echo "  샘플 유저 authorize 확인 중 ($SAMPLE_ADDRESS_FOR_AUTH)..."
+_AUTH_TMP=$(mktemp)
+set +e
+DEPLOY_PRIVATE_KEY="$DEPLOY_PRIVATE_KEY" \
+DEPLOY_RPC_URL="$DEPLOY_RPC_URL" \
+FIAT_MANAGER_PROXY="$FIAT_MANAGER_PROXY" \
+SAMPLE_ADDRESS="$SAMPLE_ADDRESS_FOR_AUTH" \
+npx hardhat run scripts/authorize.js --network stablenet 2>&1 | tee "$_AUTH_TMP"
+_AUTH_EXIT=${PIPESTATUS[0]}
+set -e
+
+if [[ $_AUTH_EXIT -ne 0 ]]; then
+  rm -f "$_AUTH_TMP"
+  die "샘플 유저 authorize 실패 (exit $_AUTH_EXIT). 위 로그를 확인해주세요."
+fi
+
+if grep -q "^AUTHORIZE_OK=" "$_AUTH_TMP"; then
+  ok "샘플 유저 authorize 완료"
+elif grep -q "^AUTHORIZE_SKIPPED=" "$_AUTH_TMP"; then
+  warn "샘플 유저 이미 authorized - 건너뜀"
+else
+  rm -f "$_AUTH_TMP"
+  die "샘플 유저 authorize 실패. 위 로그를 확인해주세요."
+fi
+rm -f "$_AUTH_TMP"
 
 # ──────────────────────────────────────────────────────────────────
 # 5. config.go 컨트랙트 주소 자동 업데이트
@@ -150,6 +219,7 @@ step "6/6" "샘플 유저 DB 등록"
 SAMPLE_USER_ID=$(grep 'SampleUserID:'    "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
 SAMPLE_ADDRESS=$(grep 'SampleAddress:'   "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
 SAMPLE_ACCOUNT=$(grep 'SampleAccountNo:' "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
+SAMPLE_PRIVATE_KEY=$(grep 'SamplePrivateKey:' "$GATEWAY_CONFIG" | sed 's/.*"\([^"]*\)".*/\1/')
 
 PG_DSN="host=localhost port=5432 user=gateway password=secret dbname=gateway sslmode=disable"
 
@@ -187,4 +257,14 @@ echo -e "    account_no : ${CYAN}$SAMPLE_ACCOUNT${NC}"
 echo ""
 echo -e "  게이트웨이 서버 실행:"
 echo -e "  ${YELLOW}cd gateway && go run .${NC}"
+echo ""
+echo -e "  출금 테스트 (burn.js):"
+echo -e "  ${YELLOW}cd contracts${NC}"
+echo -e "  ${YELLOW}SAMPLE_PRIVATE_KEY=$SAMPLE_PRIVATE_KEY \\"
+echo -e "  SAMPLE_USER_ID=$SAMPLE_USER_ID \\"
+echo -e "  FIAT_TOKEN=$FIAT_TOKEN \\"
+echo -e "  FIAT_MANAGER_PROXY=$FIAT_MANAGER_PROXY \\"
+echo -e "  DEPLOY_RPC_URL=$DEPLOY_RPC_URL \\"
+echo -e "  AMOUNT=10000 \\"
+echo -e "  npx hardhat run scripts/burn.js --network stablenet${NC}"
 echo ""
